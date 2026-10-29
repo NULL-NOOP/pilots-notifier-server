@@ -10,4 +10,11 @@ serviceAccountKey.json
 # Ignore google-services.json if your repo is public
 google-services.json
 
+# Local session persistence
+sessions.json
+test_*.json
+*.db
+*.db-wal
+*.db-shm
+
 __pycache__
