@@ -1,0 +1,13 @@
+# Google / Firebase Service Account Keys (Backend)
+serviceAccountKey.json
+*service-account*.json
+*firebase-adminsdk*.json
+*-credentials.json
+*_key.json
+*.json.secret
+
+# Android Firebase Configuration
+# Ignore google-services.json if your repo is public
+google-services.json
+
+__pycache__

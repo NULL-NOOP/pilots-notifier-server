@@ -1,0 +1,16 @@
+services:
+  pocketpilots-webhook:
+    image: python:3.11-slim
+    container_name: pocketpilots-webhook
+    restart: unless-stopped
+    ports:
+      - 8000:8000
+    volumes:
+      - .:/app
+      - ./serviceAccountKey.json:/app/serviceAccountKey.json
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: >
+      bash -c "pip install --no-cache-dir fastapi uvicorn httpx pydantic firebase-admin && 
+               uvicorn app:app --host 0.0.0.0 --port 8000"
