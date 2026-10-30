@@ -21,6 +21,36 @@ DB_PATH = os.environ.get("DB_PATH", "pocketpilots.db")
 
 FIREBASE_INITIALIZED = False
 
+# Rate limiting for failed authentication/lookup attempts
+FAILED_ATTEMPTS: dict[str, list[float]] = {}
+
+
+def check_rate_limit(request: Request):
+    """Enforces rate limiting on failed/lookup attempts to prevent code brute-forcing."""
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+
+    now = datetime.now().timestamp()
+    attempts = [t for t in FAILED_ATTEMPTS.get(client_ip, []) if now - t < 60]
+    FAILED_ATTEMPTS[client_ip] = attempts
+    if len(attempts) >= 10:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many invalid attempts. Please wait 60 seconds before trying again."
+        )
+
+
+def record_failed_attempt(request: Request):
+    """Records a failed lookup attempt against the caller's IP."""
+    client_ip = request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    now = datetime.now().timestamp()
+    FAILED_ATTEMPTS.setdefault(client_ip, []).append(now)
+
 if os.path.exists(SERVICE_ACCOUNT_PATH):
     try:
         if not firebase_admin._apps:
@@ -365,20 +395,32 @@ load_sessions()
 
 
 def generate_unique_pair_code() -> str:
-    """Generates a memorable, unique 6-digit numeric pairing code."""
-    for _ in range(1000):
-        code = str(random.randint(100000, 999999))
-        if code not in SESSIONS:
-            return code
+    """
+    Generates a secure, unguessable 6-character alphanumeric pairing code (>1 billion combinations).
+    Formatted as XXX-XXX for clean human readability while preventing brute-force enumeration.
+    """
     alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-    return "".join(random.choices(alphabet, k=6))
+    for _ in range(1000):
+        p1 = "".join(random.choices(alphabet, k=3))
+        p2 = "".join(random.choices(alphabet, k=3))
+        code = f"{p1}-{p2}"
+        norm = code.replace("-", "")
+        if norm not in SESSIONS:
+            return code
+    p1 = "".join(random.choices(alphabet, k=4))
+    p2 = "".join(random.choices(alphabet, k=4))
+    return f"{p1}-{p2}"
 
 
 def get_or_create_session(pair_code: str) -> FlightSession:
-    code = pair_code.strip().replace(" ", "").upper()
-    if code not in SESSIONS:
-        SESSIONS[code] = FlightSession(code)
-    return SESSIONS[code]
+    raw = pair_code.strip().upper()
+    norm = raw.replace(" ", "").replace("-", "")
+    if norm not in SESSIONS:
+        s = FlightSession(norm)
+        SESSIONS[norm] = s
+    if raw != norm and raw not in SESSIONS:
+        SESSIONS[raw] = SESSIONS[norm]
+    return SESSIONS[norm]
 
 
 def resolve_session(
@@ -388,8 +430,11 @@ def resolve_session(
     header_code: str | None = None,
     body_pair_code: str | None = None,
     body_code: str | None = None,
-) -> FlightSession:
-    """Resolves session from path, query, header, body, or fallback single-user session."""
+) -> FlightSession | None:
+    """
+    Strictly resolves session from path, query, header, or body.
+    Never falls back to another user's session or a default pool.
+    """
     candidate = (
         path_code
         or query_code
@@ -398,18 +443,11 @@ def resolve_session(
         or body_pair_code
         or body_code
     )
-    if candidate and candidate.strip():
-        norm = candidate.strip().replace(" ", "").upper()
-        return get_or_create_session(norm)
+    if not candidate or not candidate.strip():
+        return None
 
-    # If no code supplied:
-    # 1. If only 1 non-default session exists with devices, use it
-    active_sessions = [s for k, s in SESSIONS.items() if k != "DEFAULT" and len(s.devices) > 0]
-    if len(active_sessions) == 1:
-        return active_sessions[0]
-
-    # 2. Otherwise fall back to DEFAULT session
-    return get_or_create_session("DEFAULT")
+    norm = candidate.strip().replace(" ", "").replace("-", "").upper()
+    return SESSIONS.get(norm)
 
 
 class TokenRegistration(BaseModel):
@@ -527,10 +565,8 @@ async def send_fcm_notification(
         if session:
             tokens = session.fcm_tokens
         else:
-            tokens = []
-            for s in SESSIONS.values():
-                tokens.extend(s.fcm_tokens)
-            tokens = list(dict.fromkeys(tokens))
+            print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Push rejected: No session or target tokens provided.")
+            return {"sent": 0, "failed": 0, "total": 0}
 
     code_label = session.pair_code if session else "GLOBAL"
 
@@ -705,12 +741,14 @@ async def startup_event():
 @app.post("/webhook/flight/{path_pair_code}")
 async def receive_flight_update(
     payload: FlightPayload,
+    request: Request,
     path_pair_code: str | None = None,
     code: str | None = Query(default=None),
     pair_code: str | None = Query(default=None),
     x_pair_code: str | None = Header(default=None, alias="X-Pair-Code"),
     x_code: str | None = Header(default=None, alias="X-Code"),
 ):
+    check_rate_limit(request)
     session = resolve_session(
         path_code=path_pair_code,
         query_code=code,
@@ -719,6 +757,13 @@ async def receive_flight_update(
         body_pair_code=payload.pair_code,
         body_code=payload.code,
     )
+
+    if not session:
+        record_failed_attempt(request)
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid link code. Please provide a registered pair code in the URL, header, or body."
+        )
 
     t0_sec = payload.t0 / 1000.0 if payload.t0 > 1e11 else payload.t0
     now_sec = payload.now / 1000.0 if payload.now > 1e11 else payload.now
@@ -826,12 +871,7 @@ async def register_token(data: TokenRegistration):
     session = get_or_create_session(pair_code)
     session.add_token(data.device_id, data.token)
 
-    # Mirror into DEFAULT session for single-client backwards compatibility
-    if pair_code != "DEFAULT":
-        def_session = get_or_create_session("DEFAULT")
-        def_session.add_token(data.device_id, data.token)
-
-    save_sessions()
+    save_sessions(session)
 
     print(f"[{datetime.now(LOCAL_TZ).strftime('%H:%M:%S')}] Registered device '{data.device_id}' to pair code [{pair_code}]. Total devices: {len(session.devices)}")
     return {
@@ -884,17 +924,14 @@ async def create_new_pair():
 
 
 @app.get("/pair/{pair_code}")
-async def get_pair_status(pair_code: str):
-    norm_code = pair_code.strip().replace(" ", "").upper()
+async def get_pair_status(pair_code: str, request: Request):
+    check_rate_limit(request)
+    norm_code = pair_code.strip().replace(" ", "").replace("-", "").upper()
     session = SESSIONS.get(norm_code)
     if not session:
-        return {
-            "exists": False,
-            "pair_code": norm_code,
-            "device_count": 0,
-            "devices": [],
-            "message": f"Pair code '{norm_code}' not found."
-        }
+        record_failed_attempt(request)
+        raise HTTPException(status_code=404, detail="Pair code not found.")
+
     return {
         "exists": True,
         "pair_code": norm_code,
@@ -908,10 +945,12 @@ async def get_pair_status(pair_code: str):
 
 
 @app.post("/pair/{pair_code}/test")
-async def send_test_push(pair_code: str):
-    norm_code = pair_code.strip().replace(" ", "").upper()
+async def send_test_push(pair_code: str, request: Request):
+    check_rate_limit(request)
+    norm_code = pair_code.strip().replace(" ", "").replace("-", "").upper()
     session = SESSIONS.get(norm_code)
     if not session:
+        record_failed_attempt(request)
         raise HTTPException(status_code=404, detail=f"Pair code '{norm_code}' not found.")
     if not session.fcm_tokens:
         raise HTTPException(status_code=400, detail=f"No devices / FCM tokens registered under code '{norm_code}'.")
@@ -935,40 +974,20 @@ async def send_test_push(pair_code: str):
     }
 
 
-@app.get("/pairs")
-async def list_pairs():
-    return {
-        "status": "ok",
-        "total_sessions": len(SESSIONS),
-        "sessions": [
-            {
-                "pair_code": s.pair_code,
-                "device_count": len(s.devices),
-                "devices": list(s.devices.keys()),
-                "has_active_flight": bool(s.current_flight.get("id")),
-                "last_seen": s.last_seen.isoformat(),
-            }
-            for s in SESSIONS.values()
-        ]
-    }
-
-
 @app.get("/status")
 async def get_status(
+    request: Request,
     code: str | None = Query(default=None),
     pair_code: str | None = Query(default=None)
 ):
     target_code = pair_code or code
     if target_code:
-        norm = target_code.strip().replace(" ", "").upper()
+        check_rate_limit(request)
+        norm = target_code.strip().replace(" ", "").replace("-", "").upper()
         session = SESSIONS.get(norm)
         if not session:
-            return {
-                "status": "not_found",
-                "pair_code": norm,
-                "fcm_token_registered": False,
-                "message": f"Pair code '{norm}' not found"
-            }
+            record_failed_attempt(request)
+            raise HTTPException(status_code=404, detail=f"Pair code '{norm}' not found.")
         return {
             "status": "ok",
             "pair_code": norm,
@@ -978,30 +997,22 @@ async def get_status(
             "active_flight": session.current_flight
         }
 
-    total_tokens = sum(len(s.fcm_tokens) for s in SESSIONS.values())
-    default_session = SESSIONS.get("DEFAULT")
+    # Public health check endpoint: Zero private data or user counts are leaked
     return {
         "status": "ok",
-        "firebase_initialized": FIREBASE_INITIALIZED,
-        "active_sessions_count": len(SESSIONS),
-        "total_devices_registered": total_tokens,
-        "fcm_token_registered": total_tokens > 0,
-        "active_flight": default_session.current_flight if default_session else {
-            "id": None,
-            "last_status": None
-        }
+        "service": "Pocket Pilots Notification Hub",
+        "firebase_live": FIREBASE_INITIALIZED,
+        "version": "2.1.0"
     }
 
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/pair", response_class=HTMLResponse)
 async def get_dashboard(request: Request):
-    # If API client requests application/json, return status JSON instead
+    # If API client requests application/json, return public status JSON instead
     if "application/json" in request.headers.get("accept", ""):
-        return JSONResponse(await get_status())
+        return JSONResponse(await get_status(request=request))
 
-    total_tokens = sum(len(s.fcm_tokens) for s in SESSIONS.values())
-    active_count = len([s for s in SESSIONS.values() if len(s.devices) > 0])
     fb_status_color = "#10b981" if FIREBASE_INITIALIZED else "#f59e0b"
     fb_status_text = "Initialized (Live FCM)" if FIREBASE_INITIALIZED else "Simulation Mode (No Key)"
 
@@ -1035,7 +1046,7 @@ async def get_dashboard(request: Request):
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 2rem; }}
     .stat-card {{ background: var(--card); border: 1px solid var(--card-border); border-radius: 0.75rem; padding: 1.25rem; }}
     .stat-label {{ font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }}
-    .stat-val {{ font-size: 1.85rem; font-weight: 700; color: var(--accent); }}
+    .stat-val {{ font-size: 1.35rem; font-weight: 700; color: var(--accent); }}
     .tabs {{ display: flex; gap: 0.5rem; margin-bottom: 1.5rem; border-bottom: 1px solid var(--card-border); padding-bottom: 0.5rem; }}
     .tab-btn {{ background: none; border: none; color: var(--text-muted); padding: 0.5rem 1rem; cursor: pointer; font-size: 0.95rem; font-weight: 600; border-radius: 0.5rem; }}
     .tab-btn.active {{ color: var(--accent); background: rgba(56, 189, 248, 0.1); }}
@@ -1063,7 +1074,7 @@ async def get_dashboard(request: Request):
       <span class="logo-icon">✈️</span>
       <div>
         <h1>Pocket Pilots Notification Server</h1>
-        <p style="font-size: 0.85rem; color: var(--text-muted);">Multi-Device Companion Hub for App & Chrome Extension</p>
+        <p style="font-size: 0.85rem; color: var(--text-muted);">Multi-User Private Companion Hub for App & Chrome Extension</p>
       </div>
     </div>
     <div class="badge">
@@ -1074,16 +1085,16 @@ async def get_dashboard(request: Request):
 
   <div class="grid">
     <div class="stat-card">
-      <div class="stat-label">Active Link Codes</div>
-      <div class="stat-val" id="stat-sessions">{active_count}</div>
+      <div class="stat-label">Multi-User Architecture</div>
+      <div class="stat-val" style="color: var(--success);">Isolated Silos</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Connected Devices</div>
-      <div class="stat-val" id="stat-tokens">{total_tokens}</div>
+      <div class="stat-label">Privacy Model</div>
+      <div class="stat-val" style="color: var(--accent);">Zero Cross-Visibility</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">Pairing Flow</div>
-      <div class="stat-val" style="font-size: 1.25rem; line-height: 2.2rem; color: var(--success);">6-Digit PIN</div>
+      <div class="stat-val" style="color: var(--success);">Private Link Key</div>
     </div>
   </div>
 

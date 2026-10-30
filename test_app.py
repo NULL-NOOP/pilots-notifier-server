@@ -61,9 +61,9 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
     def test_generate_unique_pair_code(self):
         code1 = app.generate_unique_pair_code()
         code2 = app.generate_unique_pair_code()
-        self.assertEqual(len(code1), 6)
-        self.assertEqual(len(code2), 6)
-        self.assertTrue(code1.isdigit() or code1.isalnum())
+        self.assertEqual(len(code1.replace("-", "")), 6)
+        self.assertEqual(len(code2.replace("-", "")), 6)
+        self.assertTrue(code1.replace("-", "").isalnum())
 
     def test_flight_session_device_management(self):
         session = app.FlightSession("TEST01")
@@ -113,7 +113,7 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resp["status"], "success")
         self.assertTrue(resp["is_new_code"])
-        self.assertEqual(len(resp["pair_code"]), 6)
+        self.assertEqual(len(resp["pair_code"].replace("-", "")), 6)
         self.assertEqual(resp["devices_count"], 1)
 
         # Check session exists in memory
@@ -188,9 +188,9 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         resolved = app.resolve_session(body_pair_code="ALPHA1")
         self.assertEqual(resolved.pair_code, "ALPHA1")
 
-        # 6. Single session fallback when only 1 session exists
+        # 6. Missing code returns None (Strict isolation, zero fallback)
         resolved = app.resolve_session()
-        self.assertEqual(resolved.pair_code, "ALPHA1")
+        self.assertIsNone(resolved)
 
     async def test_concurrent_flights_different_sessions(self):
         # Register user A
@@ -219,7 +219,8 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
             trk=[0, 40.0, -73.0, 0, 1000, 40.0, -80.0, 30000, 3600, 34.0, -118.0, 0],
             pair_code="USERA1"
         )
-        res_a = await app.receive_flight_update(payload_a, pair_code="USERA1")
+        mock_req = MagicMock()
+        res_a = await app.receive_flight_update(payload_a, request=mock_req, pair_code="USERA1")
         self.assertEqual(res_a["pair_code"], "USERA1")
         self.assertEqual(res_a["devices_notified"], 1)
 
@@ -234,7 +235,7 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
             trk=[0, 51.0, 0.0, 0, 500, 50.0, 1.0, 25000, 1800, 49.0, 2.0, 0],
             pair_code="USERB2"
         )
-        res_b = await app.receive_flight_update(payload_b, pair_code="USERB2")
+        res_b = await app.receive_flight_update(payload_b, request=mock_req, pair_code="USERB2")
         self.assertEqual(res_b["pair_code"], "USERB2")
         self.assertEqual(res_b["devices_notified"], 1)
 
@@ -275,7 +276,8 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
             pair_code=code
         ))
 
-        res = await app.send_test_push(code)
+        mock_req = MagicMock()
+        res = await app.send_test_push(code, request=mock_req)
         self.assertEqual(res["status"], "success")
         self.assertEqual(res["pair_code"], code)
 
@@ -287,17 +289,18 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
             pair_code=code
         ))
 
+        mock_req = MagicMock()
         # Query specific session
-        session_status = await app.get_status(code=code)
+        session_status = await app.get_status(request=mock_req, code=code)
         self.assertEqual(session_status["status"], "ok")
         self.assertEqual(session_status["pair_code"], code)
         self.assertEqual(session_status["device_count"], 1)
 
-        # Query global overview
-        global_status = await app.get_status()
+        # Query global public overview (must not leak user data)
+        global_status = await app.get_status(request=mock_req)
         self.assertEqual(global_status["status"], "ok")
-        self.assertTrue(global_status["total_devices_registered"] >= 1)
-        self.assertTrue(global_status["fcm_token_registered"])
+        self.assertNotIn("total_devices_registered", global_status)
+        self.assertNotIn("active_flight", global_status)
 
 
     async def test_unregister_device_and_token(self):
@@ -343,7 +346,8 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
             trk=[0, 37.0, -122.0, 0, 1000, 38.0, -110.0, 35000, 3600, 41.0, -87.0, 0],
             pair_code=code
         )
-        res = await app.receive_flight_update(payload, pair_code=code)
+        mock_req = MagicMock()
+        res = await app.receive_flight_update(payload, request=mock_req, pair_code=code)
         self.assertEqual(res["status_code"], 5)
         self.assertEqual(res["phase"], "Landed")
         self.assertEqual(res["progress_pct"], 100.0)
@@ -431,7 +435,8 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
             trk=[0, 40.64, -73.77, 0, 1800, 42.0, -70.0, 36000, 19800, 51.0, -1.0, 36000, 21600, 51.47, -0.45, 0],
             pair_code=code
         )
-        await app.receive_flight_update(payload, pair_code=code)
+        mock_req = MagicMock()
+        await app.receive_flight_update(payload, request=mock_req, pair_code=code)
         
         session = app.SESSIONS[code]
         self.assertIsNotNone(session.flight_task)
@@ -457,6 +462,21 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(reloaded_session.flight_task.done())
         
         reloaded_session.cancel_task()
+
+    async def test_unauthorized_flight_update_without_code(self):
+        mock_req = MagicMock()
+        now = 1730000000.0
+        payload = app.FlightPayload(
+            id="UNAUTH",
+            t0=now,
+            now=now,
+            origin="JFK",
+            dest="LAX",
+            planeType="B738",
+            trk=[0,0,0,0]
+        )
+        with self.assertRaises(Exception) as ctx:
+            await app.receive_flight_update(payload, request=mock_req)
 
 
 if __name__ == "__main__":
