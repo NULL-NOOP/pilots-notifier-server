@@ -18,3 +18,7 @@ test_*.json
 *.db-shm
 
 __pycache__
+.venv/
+.env
+.env.*
+!.env.example

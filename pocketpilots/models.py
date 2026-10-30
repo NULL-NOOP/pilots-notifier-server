@@ -91,3 +91,9 @@ class FlightPayload(BaseModel):
     trk: list[float]
     pair_code: str | None = None
     code: str | None = None
+
+
+class FlightCancellation(BaseModel):
+    id: str | None = None
+    pair_code: str | None = None
+    code: str | None = None

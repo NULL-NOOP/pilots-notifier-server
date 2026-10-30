@@ -11,11 +11,13 @@ from pocketpilots.config import (DB_PATH, FIREBASE_INITIALIZED, LOCAL_TZ,
 from pocketpilots.dashboard import get_dashboard
 from pocketpilots.flight_timer import (handle_flight_timer,
                                        resume_active_flight_timers)
-from pocketpilots.models import (FlightPayload, FlightSession,
-                                 TokenRegistration, TokenUnregistration)
+from pocketpilots.models import (FlightCancellation, FlightPayload,
+                                 FlightSession, TokenRegistration,
+                                 TokenUnregistration)
 from pocketpilots.notifications import send_fcm_notification
 from pocketpilots.persistence import db_save_session, get_db, init_db
-from pocketpilots.routes import (create_new_pair, get_pair_status, get_status,
+from pocketpilots.routes import (cancel_flight, create_new_pair,
+                                 get_pair_status, get_status,
                                  receive_flight_update, register_token, router,
                                  send_test_push, unregister_token)
 from pocketpilots.security import (FAILED_ATTEMPTS, check_rate_limit,

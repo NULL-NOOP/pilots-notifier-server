@@ -8,8 +8,8 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pocketpilots import config
 from pocketpilots.config import LOCAL_TZ
 from pocketpilots.flight_timer import handle_flight_timer
-from pocketpilots.models import (FlightPayload, TokenRegistration,
-                                 TokenUnregistration)
+from pocketpilots.models import (FlightCancellation, FlightPayload,
+                                 TokenRegistration, TokenUnregistration)
 from pocketpilots.notifications import send_fcm_notification
 from pocketpilots.security import check_rate_limit, record_failed_attempt
 from pocketpilots.sessions import (generate_unique_pair_code,
@@ -20,6 +20,64 @@ from pocketpilots.telemetry import (analyze_flight_profile,
                                     get_stage_from_bounds)
 
 router = APIRouter()
+
+
+@router.post("/webhook/flight/cancel")
+async def cancel_flight(
+    payload: FlightCancellation,
+    request: Request,
+    code: str | None = Query(default=None),
+    pair_code: str | None = Query(default=None),
+    x_pair_code: str | None = Header(default=None, alias="X-Pair-Code"),
+    x_code: str | None = Header(default=None, alias="X-Code"),
+):
+    check_rate_limit(request)
+    session = resolve_session(
+        query_code=code,
+        query_pair_code=pair_code,
+        header_code=x_pair_code or x_code,
+        body_pair_code=payload.pair_code,
+        body_code=payload.code,
+    )
+    if not session:
+        record_failed_attempt(request)
+        raise HTTPException(status_code=401, detail="Missing or invalid link code.")
+
+    flight = session.current_flight
+    flight_id = flight.get("id")
+    if not flight_id or (payload.id and payload.id != flight_id):
+        raise HTTPException(status_code=409, detail="No matching active trip to cancel.")
+
+    session.cancel_task()
+    route = flight.get("route") or "Flight"
+    phase_status = flight.get("last_status")
+    status_code = phase_status if phase_status in (1, 2, 3, 4, 5) else 1
+    progress = int(flight.get("progress", 0))
+    segments = flight.get("segments") or [5, 22, 46, 22, 5]
+    flight.update({
+        "id": None,
+        "phase": "Canceled",
+        "updated_at": datetime.now(LOCAL_TZ).isoformat(),
+    })
+    save_sessions(session)
+
+    result = await send_fcm_notification(
+        title=f"{route} - Canceled",
+        message="Trip canceled",
+        status_code=status_code,
+        phase_label="Canceled",
+        segments=segments,
+        route=route,
+        progress=progress,
+        tokens=session.fcm_tokens,
+        session=session,
+    )
+    return {
+        "status": "Trip canceled",
+        "pair_code": session.pair_code,
+        "devices_notified": result["sent"],
+        "flight_id": flight_id,
+    }
 
 
 @router.post("/webhook/flight")

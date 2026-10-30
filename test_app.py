@@ -413,6 +413,34 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.current_flight["phase"], "Landed")
         session.cancel_task()
 
+    async def test_cancel_flight_sends_canceled_notification(self):
+        code = "CANCEL1"
+        session = app.get_or_create_session(code)
+        session.add_token("phone", "cancel_token")
+        session.current_flight.update({
+            "id": "FLIGHT_CANCEL",
+            "route": "SFO ➔ JFK",
+            "phase": "Cruise",
+            "last_status": 3,
+            "progress": 48,
+            "segments": [5, 22, 46, 22, 5],
+        })
+        request = MagicMock()
+        with patch("pocketpilots.routes.send_fcm_notification", return_value={"sent": 1}) as send:
+            response = await app.cancel_flight(
+                app.FlightCancellation(id="FLIGHT_CANCEL"),
+                request=request,
+                x_pair_code=code,
+            )
+
+        self.assertEqual(response["status"], "Trip canceled")
+        self.assertIsNone(session.current_flight["id"])
+        self.assertEqual(session.current_flight["phase"], "Canceled")
+        send.assert_awaited_once()
+        self.assertEqual(send.await_args.kwargs["phase_label"], "Canceled")
+        self.assertEqual(send.await_args.kwargs["status_code"], 3)
+        self.assertEqual(send.await_args.kwargs["progress"], 48)
+
     async def test_html_dashboard_generation(self):
         mock_req = MagicMock()
         mock_req.headers = {"accept": "text/html"}
