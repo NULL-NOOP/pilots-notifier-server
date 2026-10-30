@@ -7,9 +7,16 @@ from unittest.mock import MagicMock, patch
 # Ensure sessions file and database are test-specific
 os.environ["SESSIONS_FILE"] = "test_sessions.json"
 os.environ["DB_PATH"] = "test_pocketpilots.db"
+os.environ["ALLOW_LEGACY_PAIR_CODES"] = "true"
 
 # Mock firebase_admin and fastapi if running in an environment without them installed
 if "fastapi" not in sys.modules:
+    class MockRouter:
+        def get(self, *args, **kwargs):
+            return lambda fn: fn
+        def post(self, *args, **kwargs):
+            return lambda fn: fn
+
     class MockFastAPI:
         def __init__(self, *args, **kwargs): pass
         def get(self, *args, **kwargs):
@@ -22,9 +29,12 @@ if "fastapi" not in sys.modules:
             def dec(fn): return fn
             return dec
         def add_middleware(self, *args, **kwargs): pass
+        def include_router(self, *args, **kwargs): pass
+        def add_api_route(self, *args, **kwargs): pass
 
     mock_fastapi = MagicMock()
     mock_fastapi.FastAPI = MockFastAPI
+    mock_fastapi.APIRouter = MockRouter
     mock_fastapi.HTTPException = Exception
     mock_fastapi.Query = lambda default=None, **kwargs: default
     mock_fastapi.Header = lambda default=None, alias=None, **kwargs: default
@@ -39,6 +49,7 @@ if "firebase_admin" not in sys.modules:
     sys.modules["firebase_admin.messaging"] = MagicMock()
 
 import app
+from pocketpilots import config
 
 
 class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
@@ -58,11 +69,17 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
                 try: os.remove(f)
                 except Exception: pass
 
+    async def register_with_pair(self, data):
+        raw_code = data.pair_code or data.code
+        if raw_code:
+            app.get_or_create_session(raw_code)
+        return await app.register_token(data, request=MagicMock())
+
     def test_generate_unique_pair_code(self):
         code1 = app.generate_unique_pair_code()
         code2 = app.generate_unique_pair_code()
-        self.assertEqual(len(code1.replace("-", "")), 6)
-        self.assertEqual(len(code2.replace("-", "")), 6)
+        self.assertEqual(len(code1.replace("-", "")), 16)
+        self.assertEqual(len(code2.replace("-", "")), 16)
         self.assertTrue(code1.replace("-", "").isalnum())
 
     def test_flight_session_device_management(self):
@@ -109,21 +126,21 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
             token="fcm_token_auto_123",
             device_id="my_phone"
         )
-        resp = await app.register_token(reg_data)
+        resp = await self.register_with_pair(reg_data)
 
         self.assertEqual(resp["status"], "success")
         self.assertTrue(resp["is_new_code"])
-        self.assertEqual(len(resp["pair_code"].replace("-", "")), 6)
+        self.assertEqual(len(resp["pair_code"].replace("-", "")), 16)
         self.assertEqual(resp["devices_count"], 1)
 
         # Check session exists in memory
-        session = app.SESSIONS[resp["pair_code"]]
+        session = app.SESSIONS[resp["pair_code"].replace("-", "")]
         self.assertEqual(session.devices["my_phone"], "fcm_token_auto_123")
 
     async def test_register_multiple_devices_to_same_code(self):
         pair_code = "778899"
         # Register device 1
-        resp1 = await app.register_token(app.TokenRegistration(
+        resp1 = await self.register_with_pair(app.TokenRegistration(
             token="token_device_1",
             device_id="phone_1",
             pair_code=pair_code
@@ -132,7 +149,7 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp1["devices_count"], 1)
 
         # Register device 2 to the same code
-        resp2 = await app.register_token(app.TokenRegistration(
+        resp2 = await self.register_with_pair(app.TokenRegistration(
             token="token_device_2",
             device_id="tablet_2",
             pair_code=pair_code
@@ -192,16 +209,21 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         resolved = app.resolve_session()
         self.assertIsNone(resolved)
 
+    def test_short_pair_codes_rejected_by_default_policy(self):
+        app.get_or_create_session("OLD123")
+        with patch.object(config, "ALLOW_LEGACY_PAIR_CODES", False):
+            self.assertIsNone(app.resolve_session(path_code="OLD123"))
+
     async def test_concurrent_flights_different_sessions(self):
         # Register user A
-        await app.register_token(app.TokenRegistration(
+        await self.register_with_pair(app.TokenRegistration(
             token="token_user_a",
             device_id="phone_a",
             pair_code="USERA1"
         ))
 
         # Register user B
-        await app.register_token(app.TokenRegistration(
+        await self.register_with_pair(app.TokenRegistration(
             token="token_user_b",
             device_id="phone_b",
             pair_code="USERB2"
@@ -255,7 +277,7 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_fcm_notification_simulation(self):
         # In simulation mode (without serviceAccountKey.json)
-        app.FIREBASE_INITIALIZED = False
+        config.FIREBASE_INITIALIZED = False
         res = await app.send_fcm_notification(
             title="Test Push",
             message="Test message",
@@ -270,7 +292,7 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
 
     async def test_test_pair_notification_endpoint(self):
         code = "TEST99"
-        await app.register_token(app.TokenRegistration(
+        await self.register_with_pair(app.TokenRegistration(
             token="test_fcm_token",
             device_id="tester_phone",
             pair_code=code
@@ -283,7 +305,7 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
 
     async def test_get_status_session_and_global(self):
         code = "STATUS1"
-        await app.register_token(app.TokenRegistration(
+        await self.register_with_pair(app.TokenRegistration(
             token="tok_status",
             device_id="phone_status",
             pair_code=code
@@ -296,6 +318,10 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session_status["pair_code"], code)
         self.assertEqual(session_status["device_count"], 1)
 
+        # Mobile clients pass the private code in a header to avoid URL logs.
+        header_status = await app.get_status(request=mock_req, x_pair_code=code)
+        self.assertEqual(header_status["pair_code"], code)
+
         # Query global public overview (must not leak user data)
         global_status = await app.get_status(request=mock_req)
         self.assertEqual(global_status["status"], "ok")
@@ -305,10 +331,10 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
 
     async def test_unregister_device_and_token(self):
         code = "UNREG1"
-        await app.register_token(app.TokenRegistration(
+        await self.register_with_pair(app.TokenRegistration(
             token="tok1", device_id="dev1", pair_code=code
         ))
-        await app.register_token(app.TokenRegistration(
+        await self.register_with_pair(app.TokenRegistration(
             token="tok2", device_id="dev2", pair_code=code
         ))
         session = app.SESSIONS[code]
@@ -317,7 +343,7 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         # Unregister by device_id
         res1 = await app.unregister_token(app.TokenUnregistration(
             device_id="dev1", pair_code=code
-        ))
+        ), request=MagicMock())
         self.assertEqual(res1["removed_count"], 1)
         self.assertEqual(len(session.devices), 1)
         self.assertNotIn("dev1", session.devices)
@@ -325,13 +351,43 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         # Unregister by token
         res2 = await app.unregister_token(app.TokenUnregistration(
             token="tok2", pair_code=code
-        ))
+        ), request=MagicMock())
         self.assertEqual(res2["removed_count"], 1)
         self.assertEqual(len(session.devices), 0)
 
+    async def test_registration_cannot_claim_unissued_pair_code(self):
+        code = "UNISSUED-CODE"
+        with self.assertRaises(Exception):
+            await app.register_token(app.TokenRegistration(
+                token="attacker_token", device_id="attacker_device", pair_code=code
+            ), request=MagicMock())
+        self.assertNotIn(code.replace("-", ""), app.SESSIONS)
+
+    async def test_unregister_requires_pair_code_and_is_session_scoped(self):
+        await self.register_with_pair(app.TokenRegistration(
+            token="token_a", device_id="device_a", pair_code="SCOPEA"
+        ))
+        await self.register_with_pair(app.TokenRegistration(
+            token="token_b", device_id="device_b", pair_code="SCOPEB"
+        ))
+
+        with self.assertRaises(Exception):
+            await app.unregister_token(
+                app.TokenUnregistration(device_id="device_a"), request=MagicMock()
+            )
+        self.assertIn("device_a", app.SESSIONS["SCOPEA"].devices)
+        self.assertIn("device_b", app.SESSIONS["SCOPEB"].devices)
+
+        result = await app.unregister_token(app.TokenUnregistration(
+            device_id="device_a", pair_code="SCOPEA"
+        ), request=MagicMock())
+        self.assertEqual(result["removed_count"], 1)
+        self.assertNotIn("device_a", app.SESSIONS["SCOPEA"].devices)
+        self.assertIn("device_b", app.SESSIONS["SCOPEB"].devices)
+
     async def test_flight_landed_status(self):
         code = "LAND10"
-        await app.register_token(app.TokenRegistration(
+        await self.register_with_pair(app.TokenRegistration(
             token="tok_land", device_id="phone_land", pair_code=code
         ))
         now = 1730005000.0
@@ -376,7 +432,7 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         class MockUnregisteredError(Exception):
             pass
 
-        app.FIREBASE_INITIALIZED = True
+        config.FIREBASE_INITIALIZED = True
         app.messaging.UnregisteredError = MockUnregisteredError
 
         class MockMessage:
@@ -410,13 +466,13 @@ class TestPocketPilotsNotificationServer(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("device_stale", session.devices)
         self.assertEqual(session.fcm_tokens, ["valid_token"])
 
-        app.FIREBASE_INITIALIZED = False
+        config.FIREBASE_INITIALIZED = False
 
 
     async def test_resume_long_haul_flight_after_restart(self):
         import time
         code = "LONGHAUL"
-        await app.register_token(app.TokenRegistration(
+        await self.register_with_pair(app.TokenRegistration(
             token="tok_long", device_id="phone_long", pair_code=code
         ))
         
